@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Property Map — UTM38 Polygon Editor</title>
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--accent:#60a5fa;--muted:#94a3b8;--glass: rgba(255,255,255,0.03)}
+    html,body{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,'Helvetica Neue',Arial}
+    body{background:linear-gradient(180deg,#071126 0%, #071a2a 100%);color:#e6eef8}
+    .app{display:grid;grid-template-columns:440px 1fr;gap:20px;height:100vh;padding:24px}
+
+    .panel{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border-radius:14px;padding:18px;box-shadow:0 6px 30px rgba(2,6,23,0.6);overflow:auto}
+    h1{margin:0 0 8px;font-size:20px}
+    p.lead{margin:0 0 14px;color:var(--muted);font-size:13px}
+
+    .controls{display:flex;gap:8px;margin-bottom:12px}
+    .controls > *{flex:1}
+    .btn{background:linear-gradient(90deg,var(--accent),#3b82f6);border:none;padding:10px 12px;border-radius:10px;color:#04233b;font-weight:600;cursor:pointer}
+    .btn.ghost{background:transparent;border:1px solid rgba(255,255,255,0.06);color:var(--muted);font-weight:600}
+
+    .point-list{margin-top:8px;display:flex;flex-direction:column;gap:8px}
+    .point-row{display:flex;gap:8px;align-items:center;padding:8px;border-radius:10px;background:var(--glass);border:1px solid rgba(255,255,255,0.02)}
+    .point-row.dragging{opacity:0.6}
+    .idx{width:36px;height:36px;border-radius:8px;background:rgba(255,255,255,0.03);display:flex;align-items:center;justify-content:center;font-weight:700}
+    .coords{display:flex;gap:6px;flex:1}
+    .coords input{width:100%;padding:6px;border-radius:8px;border:none;background:transparent;color:inherit;outline:none}
+    .row-actions{display:flex;gap:6px}
+    .icon-btn{background:transparent;border:1px solid rgba(255,255,255,0.03);padding:6px;border-radius:8px;cursor:pointer}
+
+    .footer{margin-top:12px;color:var(--muted);font-size:13px}
+    .stats{display:flex;gap:10px;margin-top:10px}
+    .stat{background:rgba(255,255,255,0.02);padding:8px;border-radius:8px;font-size:13px}
+
+    #map{width:100%;height:100%;border-radius:14px;box-shadow:0 10px 40px rgba(2,6,23,0.6);overflow:hidden}
+
+    @media (max-width:920px){.app{grid-template-columns:1fr;grid-template-rows:420px 1fr;padding:12px}.panel{height:420px;}}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="panel">
+      <h1>Property Polygon Editor — UTM Zone 38N (EPSG:32638)</h1>
+      <p class="lead">Enter coordinates in <strong>UTM Zone 38N</strong> (Easting X, Northing Y). The app converts them to WGS84 to display on the satellite map. Area/perimeter are computed in metres.</p>
+
+      <div class="controls">
+        <input id="xInput" placeholder="Easting (X), meters (e.g. 492000)" />
+        <input id="yInput" placeholder="Northing (Y), meters (e.g. 4470000)" />
+        <button id="addBtn" class="btn">Add</button>
+      </div>
+
+      <div style="display:flex;gap:8px;margin-bottom:8px">
+        <button id="importBtn" class="btn ghost">Import JSON (UTM)</button>
+        <button id="exportBtn" class="btn ghost">Export JSON (UTM)</button>
+        <button id="clearBtn" class="btn ghost">Clear</button>
+      </div>
+
+      <div class="point-list" id="pointList" aria-live="polite"></div>
+
+      <div class="stats">
+        <div class="stat">Points: <strong id="count">0</strong></div>
+        <div class="stat">Perimeter: <strong id="perimeter">0</strong> m</div>
+        <div class="stat">Area: <strong id="area">0</strong> m²</div>
+      </div>
+
+      <div class="footer">
+        <small>Tiles: ESRI World Imagery • Input / Export format: UTM Zone 38N (Easting, Northing) • Map display: WGS84.</small>
+      </div>
+    </div>
+
+    
+  <div id="map" title="Satellite map (drag markers to update points)"></div>
+  </div>
+  <!-- Libraries -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.8.1/proj4.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+
+  <script>
+    // --- Configuration ---
+    // EPSG definitions: proj4 expects proj strings; EPSG:32638 is UTM zone 38N WGS84
+    const UTM38 = '+proj=utm +zone=38 +datum=WGS84 +units=m +no_defs';
+    const WGS84 = '+proj=longlat +datum=WGS84 +no_defs';
+
+    // State (stores UTM coordinates as [x, y])
+    const state = { points: [] };
+
+    // Map initialization (uses WGS84 lat/lng)
+    const map = L.map('map', { zoomControl: true }).setView([40.4093,49.8671], 13);
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Tiles &copy; Esri'
+    }).addTo(map);
+
+    let markers = [];
+    let polygon = null;
+
+    // DOM
+    const xInput = document.getElementById('xInput');
+    const yInput = document.getElementById('yInput');
+    const addBtn = document.getElementById('addBtn');
+    const pointList = document.getElementById('pointList');
+    const countEl = document.getElementById('count');
+    const perimeterEl = document.getElementById('perimeter');
+    const areaEl = document.getElementById('area');
+    const importBtn = document.getElementById('importBtn');
+    const exportBtn = document.getElementById('exportBtn');
+    const clearBtn = document.getElementById('clearBtn');
+
+    function isValidNumber(n){return typeof n === 'number' && isFinite(n)}
+
+    // Convert UTM (Easting, Northing) -> [lat, lng]
+    function utmToLatLng(x,y){
+      const [lng, lat] = proj4(UTM38, WGS84, [x, y]);
+      return [lat, lng]; // Leaflet uses [lat, lng]
+    }
+
+    // Convert latlng -> UTM [x,y]
+    function latLngToUtm(lat, lng){
+      const [x, y] = proj4(WGS84, UTM38, [lng, lat]);
+      return [x, y];
+    }
+
+    function addPointUTM(x,y,opts){
+      state.points.push([+x, +y]);
+      renderAll();
+      if(!(opts && opts.noFit)) fitToPoints();
+    }
+
+    addBtn.addEventListener('click', ()=>{
+      const x = parseFloat(xInput.value.trim());
+      const y = parseFloat(yInput.value.trim());
+      if(!isValidNumber(x) || !isValidNumber(y)){ alert('Enter valid numeric Easting and Northing (meters).'); return; }
+      addPointUTM(x,y);
+      xInput.value=''; yInput.value=''; xInput.focus();
+    });
+
+    clearBtn.addEventListener('click', ()=>{ if(!confirm('Clear all points?')) return; state.points = []; renderAll(); });
+
+    importBtn.addEventListener('click', ()=>{
+      const txt = prompt('Paste JSON array of [Easting,Northing], e.g. [[492000,4470000],[492500,4470100]]');
+      if(!txt) return;
+      try{
+        const arr = JSON.parse(txt);
+        if(!Array.isArray(arr)) throw 0;
+        const validated = arr.map(p=>[+p[0], +p[1]]);
+        for(const p of validated) if(!isValidNumber(p[0])||!isValidNumber(p[1])) throw 0;
+        state.points = validated;
+        renderAll();
+        fitToPoints();
+      }catch(e){ alert('Invalid JSON or coordinates (expect array of [Easting,Northing])'); }
+    });
+
+    exportBtn.addEventListener('click', ()=>{
+      const data = JSON.stringify(state.points, null, 2);
+      prompt('Copy JSON (UTM Easting, Northing):', data);
+    });
+
+    function renderAll(){
+      // remove existing markers and polygon
+      markers.forEach(m=>map.removeLayer(m)); markers = [];
+      if(polygon){ map.removeLayer(polygon); polygon = null; }
+      pointList.innerHTML = '';
+
+      state.points.forEach((pt, i) => {
+        const [x,y] = pt; // UTM
+        const [lat, lng] = utmToLatLng(x, y);
+
+        // marker: draggable, when dragged update state (convert back to UTM)
+        const marker = L.marker([lat, lng], { draggable: true, title: `Point ${i+1}` }).addTo(map);
+        marker.bindTooltip(String(i+1), { permanent: true, direction: 'center', className: 'marker-label' }).openTooltip();
+        marker.on('dragend', (ev) => {
+          const p = ev.target.getLatLng();
+          const utm = latLngToUtm(p.lat, p.lng);
+          state.points[i] = [utm[0], utm[1]];
+          renderAll();
+        });
+        marker.on('click', ()=>{ const el = document.querySelector(`[data-idx='${i}'] input.x`); if(el) el.focus(); });
+        markers.push(marker);
+
+        // list row
+        const row = document.createElement('div'); row.className = 'point-row'; row.draggable = true; row.dataset.idx = i;
+        const idx = document.createElement('div'); idx.className = 'idx'; idx.textContent = i+1;
+        const coords = document.createElement('div'); coords.className = 'coords';
+        const xIn = document.createElement('input'); xIn.className = 'x'; xIn.value = Math.round(x*100)/100; xIn.title = 'Easting (m)';
+        const yIn = document.createElement('input'); yIn.className = 'y'; yIn.value = Math.round(y*100)/100; yIn.title = 'Northing (m)';
+        xIn.addEventListener('change', ()=>{ const v = parseFloat(xIn.value); if(!isValidNumber(v)){ alert('Invalid Easting'); xIn.value = state.points[i][0]; return; } state.points[i][0] = v; renderAll(); });
+        yIn.addEventListener('change', ()=>{ const v = parseFloat(yIn.value); if(!isValidNumber(v)){ alert('Invalid Northing'); yIn.value = state.points[i][1]; return; } state.points[i][1] = v; renderAll(); });
+        coords.appendChild(xIn); coords.appendChild(yIn);
+        const actions = document.createElement('div'); actions.className = 'row-actions';
+        const del = document.createElement('button'); del.className = 'icon-btn'; del.title = 'Delete'; del.textContent = '🗑'; del.addEventListener('click', ()=>{ state.points.splice(i,1); renderAll(); });
+        actions.appendChild(del);
+        row.appendChild(idx); row.appendChild(coords); row.appendChild(actions);
+        pointList.appendChild(row);
+
+        // drag & drop reorder handlers
+        row.addEventListener('dragstart', (e)=>{ row.classList.add('dragging'); e.dataTransfer.setData('text/plain', i); });
+        row.addEventListener('dragend', ()=>{ row.classList.remove('dragging'); });
+        row.addEventListener('dragover', (e)=>{ e.preventDefault(); });
+        row.addEventListener('drop', (e)=>{ e.preventDefault(); const from = parseInt(e.dataTransfer.getData('text/plain'), 10); const to = parseInt(row.dataset.idx, 10); if(from===to) return; const item = state.points.splice(from,1)[0]; state.points.splice(to,0,item); renderAll(); });
+      });
+
+      // draw polygon with latlngs
+      if(state.points.length > 0){
+        const latlngs = state.points.map(p => {
+          const [lat, lng] = utmToLatLng(p[0], p[1]);
+          return [lat, lng];
+        });
+        polygon = L.polygon(latlngs, { color: '#60a5fa', fillColor: '#60a5fa', fillOpacity: 0.12 }).addTo(map);
+      }
+
+      countEl.textContent = state.points.length;
+      computeStats();
+    }
+
+    // Compute area (m^2) via shoelace on UTM coordinates and perimeter (m) via Euclidean distance
+    function computeStats(){
+      if(state.points.length < 2){ perimeterEl.textContent = '0'; areaEl.textContent = '0'; return; }
+      const pts = state.points;
+
+      // Perimeter
+      let perim = 0;
+      for(let i=0;i<pts.length;i++){
+        const a = pts[i];
+        const b = pts[(i+1)%pts.length];
+        const dx = a[0]-b[0];
+        const dy = a[1]-b[1];
+        perim += Math.hypot(dx, dy);
+      }
+
+      // Shoelace area
+      let sum = 0;
+      for(let i=0;i<pts.length;i++){
+        const [x1,y1] = pts[i];
+        const [x2,y2] = pts[(i+1)%pts.length];
+        sum += (x1*y2 - x2*y1);
+      }
+      const area = Math.abs(sum)/2;
+
+      perimeterEl.textContent = Math.round(perim).toLocaleString();
+      areaEl.textContent = Math.round(area).toLocaleString();
+    }
+
+    function fitToPoints(){
+      if(state.points.length === 0) return;
+      const latlngs = state.points.map(p=>utmToLatLng(p[0], p[1]));
+      map.fitBounds(latlngs, { padding: [40,40] });
+    }
+
+    // Seed empty
+    (function init(){ renderAll(); })();
+
+    // Enter key
+    yInput.addEventListener('keydown', (e)=>{ if(e.key === 'Enter') addBtn.click(); });
+  </script>
+</body>
+</html>
